@@ -7,148 +7,83 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 const connectDB = require('./db');
 const User = require('./models/user');
 const Visit = require('./models/visit');
-const Lead = require('./models/lead');
+const ContestStat = require('./models/contestStat');
 
 connectDB();
 
-let pendingVisit = {};
+// 🌅 1. Morning Motivation Message
+cron.schedule('* * * * *', async () => {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-bot.onText(/\/start/, async (msg) => {
-  const id = msg.from.id.toString();
-  let user = await User.findOne({ telegramId: id });
-  if (!user) {
-    user = new User({ telegramId: id, name: msg.from.first_name });
-    await user.save();
+  const users = await User.find({ role: 'sales' });
+
+  for (const user of users) {
+    const earnings = await Visit.aggregate([
+      { $match: { userId: user.telegramId, timestamp: { $gte: startOfMonth }, saleDone: true } },
+      { $group: { _id: null, total: { $sum: "$earning" } } }
+    ]);
+
+    const totalEarned = earnings[0]?.total || 0;
+
+    const msg = `Good morning ${user.name}! 🌞 You’ve already earned ₹${totalEarned} this May! What a superstar 💫 Well done!\n‘May Ki Party Offer’ mein full josh chahiye – chalo aaj aur kamaate hai! 🎉`;
+
+    await bot.sendMessage(user.telegramId, msg);
   }
-  bot.sendMessage(msg.chat.id, `Welcome ${msg.from.first_name}! Use this bot to log visits and sales.`);
 });
 
-bot.on('photo', async (msg) => {
-  const fileId = msg.photo[msg.photo.length - 1].file_id;
-  const userId = msg.from.id.toString();
-  pendingVisit[userId] = { photoFileId: fileId, name: msg.from.first_name };
-  bot.sendMessage(msg.chat.id, "Got your selfie. Please send your location now.");
-});
+// 🏆 2. Contest & Leaderboard Hype
+bot.onText(/contest update/i, async (msg) => {
+  const stats = await ContestStat.find({ contestName: "May Ki Party Offer" }).sort({ earnings: -1 });
+  let update = `🔥 Contest Update – May Ki Party Offer:\n`;
 
-bot.on('location', async (msg) => {
-  const userId = msg.from.id.toString();
-  if (!pendingVisit[userId]) return bot.sendMessage(msg.chat.id, "Send your selfie first.");
-
-  const visit = new Visit({
-    userId,
-    name: pendingVisit[userId].name,
-    photoFileId: pendingVisit[userId].photoFileId,
-    location: {
-      latitude: msg.location.latitude,
-      longitude: msg.location.longitude
-    }
+  stats.slice(0, 5).forEach((s, i) => {
+    update += `${i === 0 ? "👑" : "⚡"} ${s.name} closed ${s.deals} deals and earned ₹${s.earnings}\n`;
   });
 
-  await visit.save();
-  delete pendingVisit[userId];
-  bot.sendMessage(msg.chat.id, "Visit recorded successfully.");
+  await bot.sendMessage(msg.chat.id, update);
 });
 
-bot.on('message', async (msg) => {
-  const text = msg.text?.toLowerCase();
-  const userId = msg.from.id.toString();
+// Query: What's Srishti's rank?
+bot.onText(/what'?s (.+?)'s rank/i, async (msg, match) => {
+  const name = match[1].trim();
 
-  if (text === 'sale done') {
-    const lastVisit = await Visit.findOne({ userId }).sort({ timestamp: -1 });
-    if (lastVisit) {
-      lastVisit.saleDone = true;
-      await lastVisit.save();
-      bot.sendMessage(msg.chat.id, "Sale recorded successfully.");
-    } else {
-      bot.sendMessage(msg.chat.id, "No recent visit found.");
-    }
-  }
+  const stats = await ContestStat.find({ contestName: "May Ki Party Offer" }).sort({ earnings: -1 });
+  const index = stats.findIndex(s => s.name.toLowerCase() === name.toLowerCase());
 
-  if (text?.includes('remember lead id') && text?.includes('follow up after')) {
-    const match = text.match(/lead id (\d+).*after (\d+) days/);
-    if (match) {
-      const leadId = match[1];
-      const days = parseInt(match[2]);
-      const remindAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-      await new Lead({ userId, leadId, remindAt }).save();
-      bot.sendMessage(msg.chat.id, `Reminder set for lead ${leadId} after ${days} days.`);
-    }
-  }
+  if (index === -1) return bot.sendMessage(msg.chat.id, `${name} is not on the contest leaderboard.`);
 
-  if (text?.toLowerCase().startsWith("what's")) {
-    const nameMatch = text.match(/what's (.+?)'s progress today/i);
-    if (nameMatch) {
-      const name = nameMatch[1].trim();
-      const user = await User.findOne({ name: new RegExp(`^${name}$`, 'i') });
-      if (!user) return bot.sendMessage(msg.chat.id, `No salesperson found with name "${name}".`);
+  const current = stats[index];
+  const next = stats[index - 1];
 
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      const end = new Date();
-      end.setHours(23, 59, 59, 999);
+  const remainingSales = next ? Math.max(0, next.deals - current.deals + 1) : 0;
 
-      const visits = await Visit.find({ userId: user.telegramId, timestamp: { $gte: start, $lte: end } });
-      const sales = visits.filter(v => v.saleDone).length;
-      const total = visits.length;
-
-      bot.sendMessage(msg.chat.id, `📊 Progress for ${user.name} today:\n🧭 Visits: ${total}\n✅ Sales: ${sales}\n📌 Pending Follow-ups: [manual review pending]`);
-    }
-  }
-
-  if (text?.startsWith("performance report")) {
-    const match = text.match(/performance report (.+)/i);
-    if (match) {
-      const name = match[1].trim();
-      const user = await User.findOne({ name: new RegExp(`^${name}$`, 'i') });
-      if (!user) return bot.sendMessage(msg.chat.id, `No salesperson found with name "${name}".`);
-
-      const now = new Date();
-      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-      const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0);
-
-      const thisMonthVisits = await Visit.find({ userId: user.telegramId, timestamp: { $gte: startOfMonth } });
-      const lastMonthVisits = await Visit.find({ userId: user.telegramId, timestamp: { $gte: startOfLastMonth, $lte: endOfLastMonth } });
-
-      const thisMonthSales = thisMonthVisits.filter(v => v.saleDone).length;
-      const lastMonthSales = lastMonthVisits.filter(v => v.saleDone).length;
-
-      const conversionRate = thisMonthVisits.length ? ((thisMonthSales / thisMonthVisits.length) * 100).toFixed(2) : 0;
-      const growth = lastMonthSales ? (((thisMonthSales - lastMonthSales) / lastMonthSales) * 100).toFixed(2) : 'N/A';
-      const target = 50;
-      const incentivePerSale = 1000;
-      const earned = thisMonthSales * incentivePerSale;
-      const neededForIncentive = Math.max(0, target - thisMonthSales);
-
-      bot.sendMessage(msg.chat.id, `📈 Performance Report for ${user.name}:
-✅ Sales this month: ${thisMonthSales}
-📊 Conversion rate: ${conversionRate}%
-📅 Monthly growth: ${growth}%
-🎯 Sales target: ${target}
-💰 Incentives earned: ₹${earned}
-📌 More sales needed for target: ${neededForIncentive}`);
-    }
-  }
+  const response = `${name} is currently at Rank ${index + 1}. Just ${remainingSales} more sales and you’ll be on the leaderboard! 🎯\nBuckle up champ — the party’s waiting! 🎉🍕`;
+  await bot.sendMessage(msg.chat.id, response);
 });
 
-cron.schedule('0 * * * *', async () => {
+// 📊 3. Manager (SM) Query
+bot.onText(/check (.+?)'s performance/i, async (msg, match) => {
+  const name = match[1].trim();
+  const user = await User.findOne({ name: new RegExp(`^${name}$`, 'i') });
+
+  if (!user) return bot.sendMessage(msg.chat.id, `No salesperson found with name "${name}".`);
+
   const now = new Date();
-  const leads = await Lead.find({ remindAt: { $lte: now }, reminded: false });
-  for (const lead of leads) {
-    await bot.sendMessage(lead.userId, `Reminder: Follow up on lead ID ${lead.leadId}`);
-    lead.reminded = true;
-    await lead.save();
-  }
-});
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  const end = now;
 
-cron.schedule('0 19 * * *', async () => {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const end = new Date();
-  const users = await User.find({ role: 'sales' });
-  for (const user of users) {
-    const visits = await Visit.find({ userId: user.telegramId, timestamp: { $gte: start, $lte: end }, saleDone: true });
-    const earnings = visits.length * 1000;
-    await bot.sendMessage(user.telegramId, `Good job ${user.name}! Today you earned ₹${earnings}. Let’s try to earn ₹${earnings + 1000} tomorrow!`);
-  }
+  const visits = await Visit.find({ userId: user.telegramId, timestamp: { $gte: start, $lte: end }, saleDone: true });
+
+  const totalSales = visits.length;
+  const earnings = visits.reduce((sum, v) => sum + v.earning, 0);
+  const l2a = totalSales ? ((totalSales / 295) * 100).toFixed(1) : '0.0'; // mock L2A
+  const salesLeft = Math.max(0, Math.ceil((15000 - earnings) / 1000));
+
+  const report = `${user.name} has closed ${totalSales} deals in the last ${now.getDate()} days. Her L2A is at ${l2a}%. She needs just ${salesLeft} more sale${salesLeft !== 1 ? 's' : ''} to cross ₹15,000 in earnings!`;
+
+  await bot.sendMessage(msg.chat.id, report);
 });
+// bot.on('message', (msg) => {
+//   console.log("Chat ID:", msg.chat.id);
+// });
